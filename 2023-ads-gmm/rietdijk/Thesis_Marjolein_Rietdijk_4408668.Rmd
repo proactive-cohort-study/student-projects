@@ -1,0 +1,1391 @@
+---
+title: "Thesis"
+output: html_document
+date: "2023-06-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Functions and packages
+
+```{r}
+# Load packages
+library(readr)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(lcmm)
+library(psych)
+library(scales)
+library(tidyverse)
+library(WRS2)
+library(FSA)
+library(lubridate)
+library(nortest)
+library(car)
+library(ltm)
+```
+
+```{r}
+start_covid <- as.Date("2020-02-27")
+set.seed(2023)
+```
+
+```{r}
+# Create functions
+
+## Function to create dataset with merged InvulDatum columns and before_after_covid column
+create_data <- function(df, columns) {
+  values_to_add <- c("PatientID_pseudo", "QuestionnaireStart")  # Values to add
+  columns <- c(values_to_add, columns)
+  # Subset the columns
+  data <- subset(df, select = columns)
+  # Remove rows that contain no values except for ID and QuestionnaireStart
+  data <- data[!rowSums(!is.na(data[, 3:ncol(data)])) == 0, ]
+  # Merge the InvulDatum columns and QuestionnaireStart, so that the value of QuestionnaireStart is kept if a row contains a value in both QuestionnaireStart as in an InvulDatum column, but gets replaced if it is missing
+  data <- data %>% mutate(QuestionnaireStart = coalesce(QuestionnaireStart, !!!dplyr::select(., contains("InvulDatum"))))
+  # Remove columns InvulDatum columns
+  data <- data[, !grepl('InvulDatum', names(data))]
+  # Add column 'before_after_covid' with value B for before covid or A for after/ during covid
+  data["before_after_covid"] <- NA
+  data$before_after_covid <- ifelse(data$QuestionnaireStart < start_covid, "B", "A")
+  # Return dataframe
+  return(data)
+}
+
+## Function to create dataframe with only one observation per participant (closest to before covid)
+# Only keep the rows where PedsQL has been filled in before covid
+create_data_B1 <- function(df, observation = "last") {
+  data <- df
+  # Remove empty columns
+  data <- data[!rowSums(!is.na(data[, 3:(ncol(data)-1)])) == 0, ]
+  # Only keep columns before covid
+  data <- data[data$before_after_covid == "B", ]
+  # Only keep columns with value closest to covid
+  if (observation == "last") {
+    data <- data %>%
+      group_by(PatientID_pseudo) %>%
+      filter(QuestionnaireStart == max(QuestionnaireStart)) %>%
+      ungroup()
+  }
+  # Only keep columns with first observation value
+  else if (observation == "first") {
+    data <- data %>%
+      group_by(PatientID_pseudo) %>%
+      filter(QuestionnaireStart == min(QuestionnaireStart)) %>%
+      ungroup()
+  }
+  # Remove duplicated rows
+  data <- data[!duplicated(data), ]
+  # Return dataframe
+  return(data)
+}
+
+# Print classes
+print_classes <- function(model) { 
+  class_dataset <- data.frame(PatientID_pseudo = model$pprob$PatientID_pseudo, class = model$pprob$class)
+  
+  merged_data <- merge(class_dataset, data_outcomes, by = "PatientID_pseudo")
+  
+  ggplot(data = merged_data, aes(x = time, y = LS, color = as.factor(class), group = as.factor(PatientID_pseudo)), alpha = 0.5) +
+    geom_line(alpha = 0.5) +
+    geom_point(alpha = 0.5) +
+    scale_y_continuous(name = "Life Satisfaction", limits = c(0,10)) + 
+    scale_x_continuous(name = "Date", labels = c("2018", "2019", "2020", "2020-02-27", "2021", "2022", "2023"), 
+                     breaks = c(341, 706, 1071, 1128, 1437, 1802, 2167)) +
+    geom_vline(xintercept = start_covid_time, color = 'black', linetype = 'dotted', linewidth = 1) + 
+    theme_minimal() +
+    theme(legend.position = 'none', axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), axis.title = element_text(size = 20)) +
+    facet_wrap(~ class, ncol = 2)
+}
+
+## Function to print the mean and sd for a class per 
+descriptives_LS_classes <- function(class_nr) {
+  n_participants <- length(unique(mean_b_a$PatientID_pseudo[mean_b_a$class == class_nr]))
+  mean_B <- round(mean(mean_b_a$LS[mean_b_a$class == class_nr & mean_b_a$before_after_covid == "B"]), 3)
+  SD_B <- round(sd(mean_b_a$LS[mean_b_a$class== class_nr & mean_b_a$before_after_covid == "B"]), 3)
+  mean_A <- round(mean(mean_b_a$LS[mean_b_a$class == class_nr & mean_b_a$before_after_covid == "A"]), 3)
+  SD_A <- round(sd(mean_b_a$LS[mean_b_a$class== class_nr & mean_b_a$before_after_covid == "A"]), 3)
+  diff_B_A <- wilcox.test(mean_b_a$LS[mean_b_a$before_after_covid == "A" & mean_b_a$class == class_nr], mean_b_a$LS[mean_b_a$before_after_covid == "B" & mean_b_a$class == class_nr], paired = T)
+message <- paste0("Class ", class_nr, ". Number of participants: ", n_participants, ". Mean before COVID: ", mean_B, ", SD before COVID: ", SD_B, ". Mean during COVID: ", mean_A, ", SD during COVID: ", SD_A, ".")
+print(message)
+print(diff_B_A)
+}
+
+## Function to print demographic variables Age, Gender and Patientgroup per class
+demographic_class <- function(class_nr) {
+  max_age <- floor(max(data_demographic$k_Leeftijd[data_demographic$class == class_nr]))
+  min_age <- floor(min(data_demographic$k_Leeftijd[data_demographic$class == class_nr]))
+  mean_age <- round(mean(data_demographic$k_Leeftijd[data_demographic$class == class_nr]), 3)
+  sd_age <- round(sd(data_demographic$k_Leeftijd[data_demographic$class == class_nr]), 3)
+  
+  freq_table_gender <- table(data_demographic$PatientGeslachtNr[data_demographic$class == class_nr], useNA = "ifany")
+  perc_table_gender <- prop.table(freq_table_gender)
+  
+  freq_table_patientgr <- table(data_demographic$PatientGroep[data_demographic$class == class_nr], useNA = "ifany")
+  perc_table_patientgr <- prop.table(freq_table_patientgr)
+  
+  print(paste("Class:", class_nr))
+  print(paste0("Range age: ", min_age, " - ", max_age, ". Mean age: ", mean_age, ", SD age: ", sd_age, "."))
+  print("Freq table gender:")
+  print(freq_table_gender)
+  print("Percentage table gender: ")
+  print(perc_table_gender)
+  print("Freq table patient group: ") 
+  print(freq_table_patientgr)
+  print("Percentage table patient group: ") 
+  print(perc_table_patientgr)
+}
+
+## Function to add the classes to a dataframe and class_name
+# Add class variable to data_removed
+class_and_class_name <- function(df){
+  data <- df
+  data <- data %>% mutate(class = case_when(
+    PatientID_pseudo %in% class1_ID ~ 1, 
+    PatientID_pseudo %in% class2_ID ~ 2, 
+    PatientID_pseudo %in% class3_ID ~ 3, 
+    PatientID_pseudo %in% class4_ID ~ 4
+  ))
+  data$class <- as.factor(data$class)
+  
+  data <- data %>% mutate(class_name = case_when(
+    PatientID_pseudo %in% class1_ID ~ "High Resilient (HR)", 
+    PatientID_pseudo %in% class2_ID ~ "Satisfactory Resilient (SR)", 
+    PatientID_pseudo %in% class3_ID ~ "Deteriorating (D)", 
+    PatientID_pseudo %in% class4_ID ~ "Improving (I)"
+  ))
+  data$class_name <- factor(data$class_name, 
+                            levels=c('High Resilient (HR)', 'Satisfactory Resilient (SR)', 'Deteriorating (D)', 'Improving (I)'))
+
+  return(data)
+}
+```
+
+# Pre-processing
+
+## Load data and create dummy variables of demographic variables
+
+```{r}
+# Load the data
+raw_data <- X23_5_23_Database_Jeroen_Marjolein_FINAL
+# Copy data to work with
+data <- copy(raw_data)
+```
+
+```{r}
+# Create dummy variables from the PatientGeslachtNr
+data$PatientGeslacht_M <- ifelse(data$PatientGeslachtNr == 1, 1, 0)
+data$PatientGeslacht_F <- ifelse(data$PatientGeslachtNr == 0, 1, 0)
+data$PatientGeslacht_M[is.na(data$PatientGeslacht_M)] <- 0
+data$PatientGeslacht_F[is.na(data$PatientGeslacht_F)] <- 0
+
+# Create dummy variables from the PatientGroep
+data$PatientGroep[is.na(data$PatientGroep)] <- 0
+data$PatientGroep_AI <- ifelse(data$PatientGroep == '(Auto-)immuunziekten WKZ PRO-ACTIVE', 1, 0)
+data$PatientGroep_AP <- ifelse(data$PatientGroep == 'Algemene pediatrie WKZ PRO-ACTIVE', 1, 0)
+data$PatientGroep_CF <- ifelse(data$PatientGroep == 'CF WKZ PRO-ACTIVE', 1, 0)
+data$PatientGroep_CH <- ifelse(data$PatientGroep == 'Congenitale hartziekten PRO-ACTIVE WKZ', 1, 0)
+data$PatientGroep_KN <- ifelse(data$PatientGroep == 'Kindernefrologie WKZ PRO-ACTIVE', 1, 0)
+```
+
+```{r}
+# Number of participants before excluding criteria
+print(length(unique(data$PatientID_pseudo))) # 1767
+```
+
+## Load the stringency index
+
+```{r, message = FALSE}
+# Load the stringency_index
+stringency_index_all <- read_csv("L:/Onderzoek/SP_16-707_PROactive_II/E_ResearchData/1_Students-and-researchers/2023_Marjolein_ADS-thesis_UU/06_documenten/Aangeleverd-door-Anne/Stringency_index/202305_export_owid-covid-data.csv")
+```
+
+```{r}
+# Subset the stringency index in the Netherlands, and only keep the date and stringency_index columns
+stringency_index <- subset(stringency_index_all, iso_code == 'NLD', select = c(date, stringency_index))
+```
+
+# Life Satisfaction
+
+```{r}
+# Create dataframe to store in life satisfaction values
+data_outcomes <- create_data(data, c("k_alg_pro_ext_12_18_new_InvulDatum", "k_alg_pro_ext_12_18_new_mening_leven", "k_alg_pro_ext_8_11_new_InvulDatum", "k_alg_pro_ext_8_11_new_mening_leven",  "k_alg_pro_ext_12_18_InvulDatum", "k_alg_pro_ext_12_18_mening_leven", "k_alg_pro_ext_8_11_InvulDatum", "k_alg_pro_ext_8_11_mening_leven", "k_alg_pro_8_11_InvulDatum", "k_alg_pro_8_11_leven", "k_alg_pro_8_11_new_InvulDatum", "k_alg_pro_8_11_new_leven", "k_alg_pro_12_18_InvulDatum",  "k_alg_pro_12_18_leven", "k_alg_pro_12_18_new_InvulDatum", "k_alg_pro_12_18_new_leven", "self_covid_k_InvulDatum", "self_covid_k_gevoelens"))
+
+# Merge columns with Cantril and remove original columns
+data_outcomes <- data_outcomes %>%
+  mutate(LS = rowMeans(dplyr::select(., contains("leven"), "self_covid_k_gevoelens"), na.rm = TRUE)) %>%
+  dplyr::select(-contains("leven"), -"self_covid_k_gevoelens")
+
+# Remove the participants that don't contain an observation before and during COVID
+data_outcomes <- data_outcomes %>%
+  group_by(PatientID_pseudo) %>%
+  filter(all(c("A", "B") %in% before_after_covid)) %>%
+  ungroup()
+
+# Remove duplicate rows
+data_outcomes <- data_outcomes[!duplicated(data_outcomes), ]
+```
+
+```{r}
+# Number of participants after eligibility criteria
+print(length(unique(data_outcomes$PatientID_pseudo)))
+patient_id_outcome <- unique(data_outcomes$PatientID_pseudo)
+data_removed <- data[data$PatientID_pseudo %in% patient_id_outcome, ]
+```
+
+## Stringency Index
+
+```{r}
+# Add stringency index to the dataframe
+data_outcomes <- merge(data_outcomes, stringency_index, by.x = 'QuestionnaireStart', by.y = 'date', all.x = TRUE)
+
+# Create vector with the dates from first cantril observation to first stringency index observation
+min_date <- min(data_outcomes$QuestionnaireStart, na.rm = TRUE)
+end_date <- min(stringency_index$date, na.rm = TRUE) - 1
+new_dates_SI <- seq(min_date, end_date, by = "day")
+
+# Add an empty values to SI for the dates back to the beginning of the cohort
+new_dates_df <- data.frame(date = new_dates_SI, stringency_index = NA)
+stringency_index <- rbind(stringency_index, new_dates_df)
+stringency_index$stringency_index <- ifelse(is.na(stringency_index$stringency_index), 0, stringency_index$stringency_index)
+
+# Replace NA values with 0
+data_outcomes$stringency_index <- ifelse(is.na(data_outcomes$stringency_index), 0, data_outcomes$stringency_index)
+
+# Create stringency_index_gr to store in high, low or medium stringency index
+data_outcomes$stringency_index_gr <- NA
+data_outcomes$stringency_index_gr <- ifelse(data_outcomes$stringency_index > (2/3) * max(data_outcomes$stringency_index), "H", ifelse(data_outcomes$stringency_index > (1/3) * max(data_outcomes$stringency_index), "M", "L"))
+
+# Set the stringency indeces to NA before covid
+data_outcomes$stringency_index[data_outcomes$before_after_covid == "B"] <- NA
+data_outcomes$stringency_index_gr[data_outcomes$before_after_covid == "B"] <- NA
+stringency_index$stringency_index[stringency_index$date < start_covid] <- NA
+```
+
+```{r}
+# Add time variable (for plotting and GMM)
+data_outcomes$time <- as.integer(difftime(data_outcomes$QuestionnaireStart, min_date, units = 'days')) + 1
+stringency_index$time <- as.integer(difftime(stringency_index$date, min_date, units = 'days')) + 1
+
+start_covid_time <- as.integer(difftime(start_covid, min_date, units = 'days')) + 1
+```
+
+## Plot life satisfaction and stringency index over time
+
+```{r, warning = FALSE}
+ggplot() +
+  geom_line(data = data_outcomes, aes(x = time, y = LS, color = as.factor(PatientID_pseudo)), alpha = 0.5) +
+  geom_point(data = data_outcomes, aes(x = time, y = LS, color = as.factor(PatientID_pseudo)), alpha = 0.5) +
+  geom_line(data = stringency_index, aes(x = time, y = stringency_index/9), size = 0.5, color = 'black') +
+  scale_y_continuous(name = "Life Satisfaction", limits = c(0,10), sec.axis = sec_axis(~.*9, name = "Stringency Index")) +
+  scale_x_continuous(name = "Date", labels = c("2017-01-26", "2017-10-02", "2018-06-09", "2019-02-14", "2019-10-22", "2020-02-27", "2020-06-28", "2021-03-05", "2021-11-10", "2022-07-18", "2023-05-22"), breaks = c(0, 250, 500, 750, 1000, 1128, 1250, 1500, 1750, 2000, 2308)) +
+  geom_vline(xintercept = start_covid_time, color = 'red', linetype = 'dotted', linewidth = 1) +
+  theme_minimal() +
+  theme(legend.position = 'none', axis.text.x = element_text(size = 7))
+```
+
+# Analysis
+
+## Pre-analysis
+
+### Descriptives of LS
+
+```{r}
+# Descriptive statistics wellbeing
+mean_LS <- round(mean(data_outcomes$LS), 3)
+mean_LS_B <- round(mean(data_outcomes$LS[data_outcomes$before_after_covid == 'B']), 3)
+SD_LS_B <- round(sd(data_outcomes$LS[data_outcomes$before_after_covid == 'B']), 3)
+n_obs_LS_B <- length(data_outcomes$LS[data_outcomes$before_after_covid == 'B'])
+
+mean_LS_A <- round(mean(data_outcomes$LS[data_outcomes$before_after_covid == 'A']), 3)
+SD_LS_A <- round(sd(data_outcomes$LS[data_outcomes$before_after_covid == 'A']), 3)
+n_obs_LS_A <- length(data_outcomes$LS[data_outcomes$before_after_covid == 'A'])
+
+mean_LS_A_L <- round(mean(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "L"]), 3)
+SD_LS_A_L <- round(sd(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "L"]), 3)
+n_obs_LS_A_L <- length(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "L"])
+
+mean_LS_A_M <- round(mean(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "M"]), 3)
+SD_LS_A_M <- round(sd(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "M"]), 3)
+n_obs_LS_A_M <- length(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "M"])
+
+mean_LS_A_H <- round(mean(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "H"]), 3)
+SD_LS_A_H <- round(sd(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "H"]), 3)
+n_obs_LS_A_H <- length(data_outcomes$LS[data_outcomes$before_after_covid == 'A' & data_outcomes$stringency_index_gr == "H"])
+```
+
+```{r}
+# Print the descriptives
+print(paste0("LS before: ", mean_LS_B, ", SD before: ", SD_LS_B, ", N observations before: ", n_obs_LS_B, "."))
+print(paste0("LS after: ", mean_LS_A, ", SD after: ", SD_LS_A, ", N observations after: ", n_obs_LS_A, "."))
+print(paste0("LS low SI: ", mean_LS_A_L, ", SD low SI: ", SD_LS_A_L, ", N observations low SI: ", n_obs_LS_A_L, "."))
+print(paste0("LS medium SI: ", mean_LS_A_M, ", SD medium SI: ", SD_LS_A_M, ", N observations medium SI: ", n_obs_LS_A_M, "."))
+print(paste0("LS high SI: ", mean_LS_A_H, ", SD high SI: ", SD_LS_A_H, ", N observations high SI: ", n_obs_LS_A_H, "."))
+```
+
+```{r}
+# Compute significance of difference between before and after covid
+wilcox.test(data_outcomes$LS[data_outcomes$before_after_covid == 'B'], data_outcomes$LS[data_outcomes$before_after_covid == 'A'])
+```
+
+```{r}
+# Compute significante of differnce between the SI groups
+## Between low and medium
+wilcox.test(data_outcomes$LS[data_outcomes$stringency_index_gr == "L"], data_outcomes$LS[data_outcomes$stringency_index_gr == "M"])
+
+## Between low and high
+wilcox.test(data_outcomes$LS[data_outcomes$stringency_index_gr == "L"], data_outcomes$LS[data_outcomes$stringency_index_gr == "H"])
+
+## Between medium and high
+wilcox.test(data_outcomes$LS[data_outcomes$stringency_index_gr == "M"], data_outcomes$LS[data_outcomes$stringency_index_gr == "H"])
+```
+
+### Descriptive statistics
+
+```{r}
+# Create dataframe with demographic variables and HBSC-questionnaire completed by child
+data_demographic <- create_data(data_removed, c("k_Leeftijd", "PatientGeslachtNr", "PatientGroep", names(data_removed)[grepl("k_alg_pro", names(data_removed)) & !grepl("_o_", names(data_removed))]))
+# Remove rows that contain only missing values for the HBSC-questionnaire
+data_demographic <- data_demographic[!apply(data_demographic[, 6:(ncol(data_demographic)-1)], 1, function(row) all(is.na(row) | row == "")), ]
+# Remove the HBSC questionnaires
+data_demographic <- data_demographic[, c(1:5, ncol(data_demographic))]
+# Create demographic dataframe with only the first observations
+data_demographic <- create_data_B1(data_demographic, observation = "first")
+
+# Replace this age value (had NA)
+data_demographic$k_Leeftijd[data_demographic$PatientID_pseudo == 8564] <- 15.71
+```
+
+#### Age
+
+```{r}
+# Compute mean and SD of age
+floor(min(data_demographic$k_Leeftijd))
+floor(max(data_demographic$k_Leeftijd))
+mean(data_demographic$k_Leeftijd)
+sd(data_demographic$k_Leeftijd)
+```
+
+#### Gender
+
+```{r}
+# Print the frequency table of genders
+table(data_demographic$PatientGeslachtNr, useNA = "ifany")
+prop.table(table(data_demographic$PatientGeslachtNr, useNA = "ifany"))
+```
+
+#### Patient Group
+
+```{r}
+# Print frequency table of patientgroup
+table(data_demographic$PatientGroep, useNA = "ifany")
+prop.table(table(data_demographic$PatientGroep, useNA = "ifany"))
+```
+
+#### Education
+
+```{r}
+data_edu <- create_data(data_removed, c("k_alg_pro_ext_12_18_new_InvulDatum", "k_alg_pro_ext_12_18_new_soort_onderwijs_a1","k_alg_pro_ext_8_11_new_InvulDatum", "k_alg_pro_ext_8_11_new_soort_onderwijs_a1", "k_alg_pro_ext_12_18_InvulDatum", "k_alg_pro_ext_12_18_soort_onderwijs_a1", "k_alg_pro_ext_8_11_InvulDatum", "k_alg_pro_ext_8_11_soort_onderwijs_a1", "k_alg_pro_8_11_InvulDatum", "k_alg_pro_8_11_school_soort", "k_alg_pro_8_11_new_InvulDatum", "k_alg_pro_8_11_new_school_soort", "k_alg_pro_12_18_InvulDatum", "k_alg_pro_12_18_school_soort", "k_alg_pro_12_18_new_InvulDatum", "k_alg_pro_12_18_new_school_soort"))
+
+# Remove duplicate rows
+data_edu <- distinct(data_edu, .keep_all = TRUE)
+
+# Merge columns
+## Merged twice, because there were two types of questions in different questionnaires
+school_ext <- merge_columns(data_edu[c("k_alg_pro_ext_12_18_new_soort_onderwijs_a1", "k_alg_pro_ext_8_11_new_soort_onderwijs_a1", "k_alg_pro_ext_12_18_soort_onderwijs_a1", "k_alg_pro_ext_8_11_soort_onderwijs_a1", "k_alg_pro_12_18_school_soort", "k_alg_pro_12_18_new_school_soort")])
+school_simp <- merge_columns(data_edu[c("k_alg_pro_8_11_school_soort", "k_alg_pro_8_11_new_school_soort")])
+
+# Create new dataframe with merged columns, and rename the columns
+data_edu <- data.frame(data_edu$PatientID_pseudo, data_edu$QuestionnaireStart, school_ext, school_simp, data_edu$before_after_covid)
+colnames(data_edu)[colnames(data_edu) == "data_edu.PatientID_pseudo"] <- "PatientID_pseudo"
+colnames(data_edu)[colnames(data_edu) == "data_edu.QuestionnaireStart"] <- "QuestionnaireStart"
+colnames(data_edu)[colnames(data_edu) == "data_edu.before_after_covid"] <- "before_after_covid"
+
+# Create a dataframe with only the value that is closest to covid (before)
+data_edu_B1 <- create_data_B1(data_edu, observation = "first")
+
+# Participants with education:
+ID_edu <- unique(data_edu_B1$PatientID_pseudo)
+# Difference between participants with education and without, and add these as emtpy rows to data_edu_B1
+diff <- setdiff(patient_id_outcome, ID_edu)
+new_rows <- cbind(data.frame(PatientID_pseudo = diff), data.frame(matrix(NA, nrow = length(diff), ncol = ncol(data_edu_B1) - 1, dimnames = list(NULL, colnames(data_edu_B1)[-1]))))
+data_edu_B1 <- rbind(data_edu_B1, new_rows)
+
+data_edu_B1$school_ext[data_edu_B1$school_simp == 1] <- 0
+data_edu_B1$school_ext[data_edu_B1$school_simp == 2 | data_edu_B1$school_simp == 3] <- 9 
+```
+
+```{r}
+# Frequency table of education level extended
+table(data_edu_B1$school_ext, useNA = "ifany")
+prop.table(table(data_edu_B1$school_ext, useNA = "ifany"))
+```
+
+## Growth Mixture Modelling
+
+```{r}
+# Estimating models using GMM-1 with random slope
+gmm1_S_1 <- hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ time, ng = 1, data = data_outcomes)
+
+gmm1_S_2 <- gridsearch(rep = 100, maxiter = 10, minit = gmm1_S_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ time, ng = 2, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+
+gmm1_S_3 <- gridsearch(rep = 100, maxiter = 10, minit = gmm1_S_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ time, ng = 3, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+
+gmm1_S_4 <- gridsearch(rep = 100, maxiter = 10, minit = gmm1_S_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ time, ng = 4, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+```
+
+```{r}
+# Estimating models using GMM-1 with random intercept
+gmm1_I_1 <- hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1, ng = 1, data = data_outcomes)
+
+gmm1_I_2 <- gridsearch(rep = 100, maxiter = 10, minit = gmm1_I_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1, ng = 2, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+
+gmm1_I_3 <- gridsearch(rep = 100, maxiter = 10, minit = gmm1_I_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1, ng = 3, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+
+gmm1_I_4 <- gridsearch(rep = 100, maxiter = 10, minit = gmm1_I_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1, ng = 4, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+```
+
+```{r}
+# Estimating models using GMM-2
+gmm2_1 <- hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1 + time, ng = 1, data = data_outcomes)
+
+gmm2_2 <- gridsearch(rep = 100, maxiter = 10, minit = gmm2_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1 + time, ng = 2, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+
+gmm2_3 <- gridsearch(rep = 100, maxiter = 10, minit = gmm2_1,  hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1 + time, ng = 3, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+
+gmm2_4 <- gridsearch(rep = 100, maxiter = 10, minit = gmm2_1, hlme(LS ~ time, subject = 'PatientID_pseudo', random = ~ 1 + time, ng = 4, data = data_outcomes, mixture = ~ time, nwg = TRUE))
+```
+
+```{r}
+# Print summary tables
+summarytable(gmm1_S_1, gmm1_S_2, gmm1_S_3, gmm1_S_4)
+summarytable(gmm1_I_1, gmm1_I_2, gmm1_I_3, gmm1_I_4)
+summarytable(gmm2_1, gmm2_2, gmm2_3, gmm2_4)
+
+# Print AIC's
+print("AIC GMM-1 random slope")
+gmm1_S_1$AIC
+gmm1_S_2$AIC
+gmm1_S_3$AIC
+gmm1_S_4$AIC
+print("AIC GMM-1 random intercept")
+gmm1_I_1$AIC
+gmm1_I_2$AIC
+gmm1_I_3$AIC
+gmm1_I_4$AIC
+print("AIC GMM-1 random slope")
+gmm2_1$AIC
+gmm2_2$AIC
+gmm2_3$AIC
+gmm2_4$AIC
+```
+
+```{r}
+# Print all the classes (for model selection)
+print_classes(gmm1_S_2)
+print_classes(gmm1_S_3)
+print_classes(gmm1_S_4)
+print_classes(gmm1_I_2)
+print_classes(gmm1_I_3)
+print_classes(gmm1_I_4)
+print_classes(gmm2_2)
+print_classes(gmm2_3)
+print_classes(gmm2_4)
+```
+
+```{r}
+# Specify model for further analysis
+final_model <- gmm1_I_4
+
+# Add the classes to the outcome dataset, in a new dataset named 'merged_data'
+class_dataset <- data.frame(PatientID_pseudo = final_model$pprob$PatientID_pseudo, class = final_model$pprob$class)
+merged_data <- merge(class_dataset, data_outcomes, by = "PatientID_pseudo")
+
+# Switch the classes so that the class with the most participants is class 1 etc.
+freq_table <- table(merged_data$class)
+sorted_table <- sort(freq_table, decreasing = TRUE)
+mapping <- match(merged_data$class, names(sorted_table))
+merged_data$class <- mapping
+
+# Retrieve number of classes
+classes <- sort(unique(merged_data$class))
+
+# Print summary of the final model
+summary(final_model)
+```
+
+```{r}
+# Save the participants in each group in vectors
+class1_ID <- unique(merged_data$PatientID_pseudo[merged_data$class == 1])
+class2_ID <- unique(merged_data$PatientID_pseudo[merged_data$class == 2])
+class3_ID <- unique(merged_data$PatientID_pseudo[merged_data$class == 3])
+class4_ID <- unique(merged_data$PatientID_pseudo[merged_data$class == 4]) 
+```
+
+```{r}
+# Add class and class names to data_removed
+data_removed <- class_and_class_name(data_removed)
+```
+
+## LS per class before and after COVID
+
+```{r, message = F}
+# Create a dataframe with the mean LS per participant before and after COVID
+mean_b_a <- merged_data %>% group_by(PatientID_pseudo, before_after_covid) %>% summarize(LS = mean(LS))
+
+# Add the classes to this dataframe the participants
+mean_b_a <- class_and_class_name(mean_b_a)
+```
+
+```{r}
+# Print histograms of LS per class
+remove_labels <- function(x) {
+  if (length(x) > 0){
+    return(rep("", length(x)))
+  } else {
+    return(NULL)
+  }
+}
+
+hist_plot <- ggplot(mean_b_a, aes(x = LS)) +
+  geom_histogram(binwidth = 1) +
+  labs(x = "Life Satisfaction", y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_grid(class_name ~ before_after_covid, scales = "free_y", labeller = labeller(before_after_covid = c("A" = "During COVID-19", "B" = "Before COVID-19"))) +
+  ylab("Count") +
+  scale_y_continuous(sec.axis = sec_axis(~., name = "Class", labels = remove_labels)) +
+  theme(axis.text.y.right = element_text(angle = 90, color = 'red'))+
+  theme_minimal()
+print(hist_plot)
+```
+
+```{r}
+# Print the LS descriptives for the different classes
+for (class_nr in classes) {
+  descriptives_LS_classes(class_nr)
+}
+```
+
+## Demographic Variables per class
+
+### Age, Gender, Patientgroup
+
+```{r}
+# Add classes to data_demographic
+data_demographic <- class_and_class_name(data_demographic)
+
+# Add classes to data_edu_B1
+data_edu_B1 <- class_and_class_name(data_edu_B1)
+
+# Print demographic variables for each class
+for (class_nr in classes) {
+  demographic_class(class_nr)
+  print("Freq table education: ")
+  print(table(data_edu_B1$school_ext[data_edu_B1$class == class_nr], useNA = "ifany"))
+  print("Percentage table education: ")
+  print(prop.table(table(data_edu_B1$school_ext[data_edu_B1$class == class_nr], useNA = "ifany")))
+}
+```
+
+# Resilience Factors
+
+## Create dataframes for analysis
+
+### Support Variables
+
+```{r}
+# Add mean scores of support items
+data_removed$k_alg_pro_ext_12_18_new_thuis_steun <- rowMeans(data_removed[ c('k_alg_pro_ext_12_18_new_thuis_steun_1', 'k_alg_pro_ext_12_18_new_thuis_steun_2', 'k_alg_pro_ext_12_18_new_thuis_steun_3', 'k_alg_pro_ext_12_18_new_thuis_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_ext_12_18_new_vrienden_steun <- rowMeans(data_removed[ c('k_alg_pro_ext_12_18_new_uitspraken_vrienden_1', 'k_alg_pro_ext_12_18_new_uitspraken_vrienden_2', 'k_alg_pro_ext_12_18_new_uitspraken_vrienden_3', 'k_alg_pro_ext_12_18_new_uitspraken_vrienden_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_ext_8_11_new_thuis_steun <- rowMeans(data_removed[c('k_alg_pro_ext_8_11_new_thuis_steun_1', 'k_alg_pro_ext_8_11_new_thuis_steun_2', 'k_alg_pro_ext_8_11_new_thuis_steun_3', 'k_alg_pro_ext_8_11_new_thuis_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_ext_8_11_new_vrienden_steun <- rowMeans(data_removed[c('k_alg_pro_ext_8_11_new_uitspraken_vrienden_1', 'k_alg_pro_ext_8_11_new_uitspraken_vrienden_2', 'k_alg_pro_ext_8_11_new_uitspraken_vrienden_3', 'k_alg_pro_ext_8_11_new_uitspraken_vrienden_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_ext_12_18_thuis_steun <- rowMeans(data_removed[c('k_alg_pro_ext_12_18_uitspraken_gezin_1', 'k_alg_pro_ext_12_18_uitspraken_gezin_2', 'k_alg_pro_ext_12_18_uitspraken_gezin_3', 'k_alg_pro_ext_12_18_uitspraken_gezin_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_ext_12_18_vrienden_steun <- rowMeans(data_removed[c('k_alg_pro_ext_12_18_uitspraken_vrienden_1', 'k_alg_pro_ext_12_18_uitspraken_vrienden_2', 'k_alg_pro_ext_12_18_uitspraken_vrienden_3', 'k_alg_pro_ext_12_18_uitspraken_vrienden_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_ext_8_11_thuis_steun <- rowMeans(data_removed[c('k_alg_pro_ext_8_11_uitspraken_gezin_1', 'k_alg_pro_ext_8_11_uitspraken_gezin_2', 'k_alg_pro_ext_8_11_uitspraken_gezin_3', 'k_alg_pro_ext_8_11_uitspraken_gezin_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_ext_8_11_vrienden_steun <- rowMeans(data_removed[c('k_alg_pro_ext_8_11_uitspraken_vrienden_1', 'k_alg_pro_ext_8_11_uitspraken_vrienden_2', 'k_alg_pro_ext_8_11_uitspraken_vrienden_3', 'k_alg_pro_ext_8_11_uitspraken_vrienden_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_8_11_thuis_steun <- rowMeans(data_removed[c('k_alg_pro_8_11_thuis_steun_1', 'k_alg_pro_8_11_thuis_steun_2', 'k_alg_pro_8_11_thuis_steun_3', 'k_alg_pro_8_11_thuis_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_8_11_vrienden_steun <- rowMeans(data_removed[c('k_alg_pro_8_11_vrienden_steun_1', 'k_alg_pro_8_11_vrienden_steun_2', 'k_alg_pro_8_11_vrienden_steun_3', 'k_alg_pro_8_11_vrienden_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_8_11_new_thuis_steun <- rowMeans(data_removed[c('k_alg_pro_8_11_new_thuis_steun_1', 'k_alg_pro_8_11_new_thuis_steun_2', 'k_alg_pro_8_11_new_thuis_steun_3', 'k_alg_pro_8_11_new_thuis_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_8_11_new_vrienden_steun <- rowMeans(data_removed[c('k_alg_pro_8_11_new_vrienden_steun_1', 'k_alg_pro_8_11_new_vrienden_steun_2', 'k_alg_pro_8_11_new_vrienden_steun_3')], na.rm = TRUE)
+
+data_removed$k_alg_pro_12_18_thuis_steun <- rowMeans(data_removed[c('k_alg_pro_12_18_thuis_steun_1', 'k_alg_pro_12_18_thuis_steun_2', 'k_alg_pro_12_18_thuis_steun_3', 'k_alg_pro_12_18_thuis_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_12_18_vrienden_steun <- rowMeans(data_removed[c('k_alg_pro_12_18_vrienden_steun_1', 'k_alg_pro_12_18_vrienden_steun_2', 'k_alg_pro_12_18_vrienden_steun_3', 'k_alg_pro_12_18_vrienden_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_12_18_new_thuis_steun <- rowMeans(data_removed[c('k_alg_pro_12_18_new_thuis_steun_1', 'k_alg_pro_12_18_new_thuis_steun_2', 'k_alg_pro_12_18_new_thuis_steun_3', 'k_alg_pro_12_18_new_thuis_steun_4')], na.rm = TRUE)
+
+data_removed$k_alg_pro_12_18_new_vrienden_steun <- rowMeans(data_removed[c('k_alg_pro_12_18_new_vrienden_steun_1', 'k_alg_pro_12_18_new_vrienden_steun_2', 'k_alg_pro_12_18_new_vrienden_steun_3', 'k_alg_pro_12_18_new_vrienden_steun_4')], na.rm = TRUE)
+```
+
+```{r}
+data_support <- create_data(data_removed, c('k_alg_pro_ext_12_18_new_InvulDatum', 'k_alg_pro_ext_12_18_new_thuis_steun', 'k_alg_pro_ext_12_18_new_vrienden_steun', 'k_alg_pro_ext_8_11_new_InvulDatum',  'k_alg_pro_ext_8_11_new_thuis_steun', 'k_alg_pro_ext_8_11_new_vrienden_steun', 'k_alg_pro_ext_12_18_InvulDatum', 'k_alg_pro_ext_12_18_thuis_steun', 'k_alg_pro_ext_12_18_vrienden_steun', 'k_alg_pro_ext_8_11_InvulDatum',  'k_alg_pro_ext_8_11_thuis_steun', 'k_alg_pro_ext_8_11_vrienden_steun', 'k_alg_pro_8_11_InvulDatum', 'k_alg_pro_8_11_thuis_steun', 'k_alg_pro_8_11_vrienden_steun', 'k_alg_pro_8_11_new_InvulDatum', 'k_alg_pro_8_11_new_thuis_steun', 'k_alg_pro_8_11_new_vrienden_steun', 'k_alg_pro_12_18_InvulDatum', 'k_alg_pro_12_18_thuis_steun', 'k_alg_pro_12_18_vrienden_steun', 'k_alg_pro_12_18_new_InvulDatum', 'k_alg_pro_12_18_new_thuis_steun', 'k_alg_pro_12_18_new_vrienden_steun'))
+
+# Remove duplicate rows
+data_support <- distinct(data_support, .keep_all = TRUE)
+
+# Create dataset with only the most recent before COVID observations
+data_support_B1 <- create_data_B1(data_support)
+
+# Merge the support at home variables and the support from friends variables
+data_support_B1 <- data_support_B1 %>%
+  mutate(support_home = rowMeans(dplyr::select(., contains("thuis")), na.rm = TRUE)) %>%
+  dplyr::select(-contains("thuis")) %>%
+  mutate(support_friends = rowMeans(dplyr::select(., contains("vrienden")), na.rm = TRUE)) %>%
+  dplyr::select(- contains("vrienden"))
+
+# Add classes to data_demographic
+data_support_B1 <- class_and_class_name(data_support_B1)
+
+# Vector with ID's of patients that completed the support items before COVID
+ID_support <- unique(data_support_B1$PatientID_pseudo)
+```
+
+### READ Variables
+
+```{r}
+data_READ <- create_data(data_removed, c("self_veerkracht_InvulDatum", "READ_subschaal_perscomp", "READ_subschaal_soccomp", "READ_subschaal_structuur", "READ_subschaal_socsteun", "READ_subschaal_famcohesie"))
+
+# Remove duplicate rows
+data_READ <- distinct(data_READ, .keep_all = TRUE)
+
+# Create dataset with only the most recent before COVID observations
+data_READ_B1 <- create_data_B1(data_READ)
+
+# Add classes to data_demographic
+data_READ_B1 <- class_and_class_name(data_READ_B1)
+
+# Vector with ID's of patients that completed the support items before COVID
+ID_READ <- unique(data_READ_B1$PatientID_pseudo)
+```
+
+### PedsQL Variables
+
+```{r}
+# 
+data_PedsQL <- create_data(data_removed, c("k_pedsql_8_12_InvulDatum", "k_pedsql_13_17_InvulDatum", "p_tot", "p_lich", "p_emo", "p_soc", "p_school"))
+
+# Remove duplicate rows
+data_PedsQL <- distinct(data_PedsQL, .keep_all = TRUE)
+
+# Create dataset with only the most recent before COVID observations
+data_PedsQL_B1 <- create_data_B1(data_PedsQL)
+
+# Add classes to data_demographic
+data_PedsQL_B1 <- class_and_class_name(data_PedsQL_B1)
+
+# Vector with ID's of patients that completed the support items before COVID
+ID_PedsQL <- unique(data_PedsQL_B1$PatientID_pseudo)
+```
+
+### Merged Dataset (incl. Cantril)
+
+```{r, warning =FALSE}
+# Create dataset with all resilience variables and LS
+data_outcomes_B1 <- create_data_B1(data_outcomes)
+
+all_var_B1 <- merge(data_support_B1, data_READ_B1, by = "PatientID_pseudo", all = TRUE)
+all_var_B1 <- merge(all_var_B1, data_PedsQL_B1, by = "PatientID_pseudo", all = TRUE)
+all_var_B1 <- merge(all_var_B1, data_outcomes_B1, by = "PatientID_pseudo", all = TRUE)
+
+all_var_B1 <- subset(all_var_B1, select = !grepl("\\.x$|\\.y$|\\.z$|time|class|stringency_index|p_tot", names(all_var_B1)))
+```
+
+## Pre-Analysis
+
+### Correlation Between Variables
+
+```{r}
+# Print correlation matrix
+cor_matrix <- round(cor(all_var_B1[, -1], use = 'pairwise.complete.obs'), digits = 2)
+print(cor_matrix)
+```
+
+```{r}
+# Print correlation with corresponding p-value
+p_values <- corr.test(all_var_B1[, -1], use = 'pairwise.complete.obs')$p
+
+sig_matrix <- matrix("", nrow = ncol(cor_matrix), ncol = ncol(cor_matrix))
+
+sig_matrix[p_values < 0.001] <- "***"
+sig_matrix[p_values >= 0.001 & p_values < 0.01] <- "**"
+sig_matrix[p_values >= 0.01 & p_values < 0.05] <- "*"
+
+cor_sig_matrix <- paste(round(cor_matrix, 2), sig_matrix, sep = "")
+
+print(cor_sig_matrix)
+```
+
+### Plots
+
+```{r}
+ggplot(data_support_B1, aes(x = class_name, y = support_home)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Support at Home") +
+  ggtitle("Box Plots of Support at Home per Class") +
+  theme_minimal()
+
+ggplot(data_support_B1, aes(x = class_name, y = support_friends)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Support from Friends") +
+  ggtitle("Box Plots of Support from Friends per Class") +
+  theme_minimal()
+
+ggplot(data_READ_B1, aes(x = class_name, y = READ_subschaal_perscomp)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Personal Competence") +
+  ggtitle("Box Plots of Personal Competence per Class") +
+  theme_minimal()
+
+ggplot(data_READ_B1, aes(x = class_name, y = READ_subschaal_soccomp)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Social Competence") +
+  ggtitle("Box Plots of Social Competence per Class") +
+  theme_minimal()
+
+ggplot(data_READ_B1, aes(x = class_name, y = READ_subschaal_structuur)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Structured Style") +
+  ggtitle("Box Plots of Structured Style per Class") +
+  theme_minimal()
+
+ggplot(data_READ_B1, aes(x = class_name, y = READ_subschaal_socsteun)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Social Support") +
+  ggtitle("Box Plots of Social Support per Class") +
+  theme_minimal()
+
+ggplot(data_READ_B1, aes(x = class_name, y = READ_subschaal_famcohesie)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Family Cohesion") +
+  ggtitle("Box Plots of Family Cohesion per Class") +
+  theme_minimal()
+
+ggplot(data_PedsQL_B1, aes(x = class_name, y = p_lich)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Physical Functioning") +
+  ggtitle("Box Plots of Physical Functioning per Class") +
+  theme_minimal()
+
+ggplot(data_PedsQL_B1, aes(x = class_name, y = p_emo)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Emotional Functioning") +
+  ggtitle("Box Plots of Emotional Functioning per Class") +
+  theme_minimal()
+
+ggplot(data_PedsQL_B1, aes(x = class_name, y = p_soc)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "Social Functioning") +
+  ggtitle("Box Plots of Social Functioning per Class") +
+  theme_minimal()
+
+ggplot(data_PedsQL_B1, aes(x = class_name, y = p_school)) +
+  geom_boxplot() +
+  labs(x = "Class", y = "School Functioning") +
+  ggtitle("Box Plots of School Functioning per Class") +
+  theme_minimal()
+```
+
+### Scores
+
+```{r}
+print("Support at home")
+print("Class 1:")
+mean(data_support_B1$support_home[data_support_B1$class == 1])
+sd(data_support_B1$support_home[data_support_B1$class == 1])
+print("Class 2:")
+mean(data_support_B1$support_home[data_support_B1$class == 2])
+sd(data_support_B1$support_home[data_support_B1$class == 2])
+print("Class 3:")
+mean(data_support_B1$support_home[data_support_B1$class == 3])
+sd(data_support_B1$support_home[data_support_B1$class == 3])
+print("Class 4:")
+mean(data_support_B1$support_home[data_support_B1$class == 4])
+sd(data_support_B1$support_home[data_support_B1$class == 4])
+
+print("Support from friends")
+print("Class 1:")
+mean(data_support_B1$support_friends[data_support_B1$class == 1])
+sd(data_support_B1$support_friends[data_support_B1$class == 1])
+print("Class 2:")
+mean(data_support_B1$support_friends[data_support_B1$class == 2])
+sd(data_support_B1$support_friends[data_support_B1$class == 2])
+print("Class 3:")
+mean(data_support_B1$support_friends[data_support_B1$class == 3])
+sd(data_support_B1$support_friends[data_support_B1$class == 3])
+print("Class 4:")
+mean(data_support_B1$support_friends[data_support_B1$class == 4])
+sd(data_support_B1$support_friends[data_support_B1$class == 4])
+
+print("Personal Competence")
+print("Class 1:")
+mean(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 1])
+sd(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 1])
+print("Class 2:")
+mean(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 2])
+sd(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 2])
+print("Class 3:")
+mean(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 3])
+sd(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 3])
+print("Class 4:")
+mean(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 4])
+sd(data_READ_B1$READ_subschaal_perscomp[data_READ_B1$class == 4])
+
+print("Social competence")
+print("Class 1:")
+mean(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 1])
+sd(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 1])
+print("Class 2:")
+mean(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 2])
+sd(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 2])
+print("Class 3:")
+mean(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 3])
+sd(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 3])
+print("Class 4:")
+mean(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 4])
+sd(data_READ_B1$READ_subschaal_soccomp[data_READ_B1$class == 4])
+
+print("Structured Style")
+print("Class 1:")
+mean(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 1])
+sd(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 1])
+print("Class 2:")
+mean(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 2])
+sd(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 2])
+print("Class 3:")
+mean(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 3])
+sd(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 3])
+print("Class 4:")
+mean(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 4])
+sd(data_READ_B1$READ_subschaal_structuur[data_READ_B1$class == 4])
+
+print("Social support")
+print("Class 1:")
+mean(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 1])
+sd(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 1])
+print("Class 2:")
+mean(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 2])
+sd(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 2])
+print("Class 3:")
+mean(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 3])
+sd(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 3])
+print("Class 4:")
+mean(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 4])
+sd(data_READ_B1$READ_subschaal_socsteun[data_READ_B1$class == 4])
+
+print("Family cohesion")
+print("Class 1:")
+mean(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 1])
+sd(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 1])
+print("Class 2:")
+mean(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 2])
+sd(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 2])
+print("Class 3:")
+mean(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 3])
+sd(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 3])
+print("Class 4:")
+mean(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 4])
+sd(data_READ_B1$READ_subschaal_famcohesie[data_READ_B1$class == 4])
+
+print("Physical functioning")
+print("Class 1:")
+mean(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 1])
+sd(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 1])
+print("Class 2:")
+mean(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 2])
+sd(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 2])
+print("Class 3:")
+mean(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 3])
+sd(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 3])
+print("Class 4:")
+mean(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 4])
+sd(data_PedsQL_B1$p_lich[data_PedsQL_B1$class == 4])
+
+print("Emotional functioning")
+print("Class 1:")
+mean(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 1])
+sd(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 1])
+print("Class 2:")
+mean(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 2])
+sd(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 2])
+print("Class 3:")
+mean(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 3])
+sd(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 3])
+print("Class 4:")
+mean(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 4])
+sd(data_PedsQL_B1$p_emo[data_PedsQL_B1$class == 4])
+
+print("Social functioning")
+print("Class 1:")
+mean(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 1])
+sd(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 1])
+print("Class 2:")
+mean(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 2])
+sd(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 2])
+print("Class 3:")
+mean(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 3])
+sd(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 3])
+print("Class 4:")
+mean(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 4])
+sd(data_PedsQL_B1$p_soc[data_PedsQL_B1$class == 4])
+
+print("School functioning")
+print("Class 1:")
+mean(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 1])
+sd(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 1])
+print("Class 2:")
+mean(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 2])
+sd(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 2])
+print("Class 3:")
+mean(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 3])
+sd(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 3])
+print("Class 4:")
+mean(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 4])
+sd(data_PedsQL_B1$p_school[data_PedsQL_B1$class == 4])
+```
+
+### Assumption Check
+
+```{r}
+# Assumption check support at home
+# Create model
+ANOVA_support_thuis <- aov(support_home ~ class, data = data_support_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_support_thuis))
+qqline(residuals(ANOVA_support_thuis))
+# Compute Anderson-Darling test for normality
+ad.test(data_support_B1$support_home)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_support_thuis, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_support_thuis)
+```
+
+```{r}
+# Assumption check support from friends
+# Create model
+ANOVA_support_vrienden <- aov(support_friends ~ class, data = data_support_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_support_vrienden))
+qqline(residuals(ANOVA_support_vrienden))
+# Compute Anderson-Darling test for normality
+ad.test(data_support_B1$support_friends)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_support_vrienden, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_support_vrienden)
+```
+
+```{r}
+# Assumption check personal competence
+# Create model
+ANOVA_READ_perscomp <- aov(READ_subschaal_perscomp ~ class, data = data_READ_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_READ_perscomp))
+qqline(residuals(ANOVA_READ_perscomp))
+# Compute Anderson-Darling test for normality
+ad.test(data_READ_B1$READ_subschaal_perscomp)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_READ_perscomp, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_READ_perscomp)
+```
+
+```{r}
+# Assumption check social competence
+# Create model
+ANOVA_READ_soccomp <- aov(READ_subschaal_soccomp ~ class, data = data_READ_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_READ_soccomp))
+qqline(residuals(ANOVA_READ_soccomp))
+# Compute Anderson-Darling test for normality
+ad.test(data_READ_B1$READ_subschaal_soccomp)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_READ_soccomp, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_READ_soccomp)
+```
+
+```{r}
+# Assumption check structured style
+# Create model
+ANOVA_READ_structuur <- aov(READ_subschaal_structuur ~ class, data = data_READ_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_READ_structuur))
+qqline(residuals(ANOVA_READ_structuur))
+# Compute Anderson-Darling test for normality
+ad.test(data_READ_B1$READ_subschaal_structuur)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_READ_structuur, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_READ_structuur)
+```
+
+```{r}
+# Assumption check social support
+# Create model
+ANOVA_READ_socsteun <- aov(READ_subschaal_socsteun ~ class, data = data_READ_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_READ_socsteun))
+qqline(residuals(ANOVA_READ_socsteun))
+# Compute Anderson-Darling test for normality
+ad.test(data_READ_B1$READ_subschaal_socsteun)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_READ_socsteun, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_READ_socsteun)
+```
+
+```{r}
+# Assumption check family cohesion
+# Create model
+ANOVA_READ_famcohesie <- aov(READ_subschaal_famcohesie ~ class, data = data_READ_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_READ_famcohesie))
+qqline(residuals(ANOVA_READ_famcohesie))
+# Compute Anderson-Darling test for normality
+ad.test(data_READ_B1$READ_subschaal_famcohesie)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_READ_famcohesie, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_READ_famcohesie)
+```
+
+```{r}
+# Assumption check physical functioning
+# Create model
+ANOVA_p_lich <- aov(p_lich ~ class, data = data_PedsQL_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_p_lich))
+qqline(residuals(ANOVA_p_lich))
+# Compute Anderson-Darling test for normality
+ad.test(data_PedsQL_B1$p_lich)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_p_lich, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_p_lich)
+```
+
+```{r}
+# Assumption check emotional functioning
+# Create model
+ANOVA_p_emo <- aov(p_emo ~ class, data = data_PedsQL_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_p_emo))
+qqline(residuals(ANOVA_p_emo))
+# Compute Anderson-Darling test for normality
+ad.test(data_PedsQL_B1$p_emo)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_p_emo, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_p_emo)
+```
+
+```{r}
+# Assumption check social functioning
+# Create model
+ANOVA_p_soc <- aov(p_soc ~ class, data = data_PedsQL_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_p_soc))
+qqline(residuals(ANOVA_p_soc))
+# Compute Anderson-Darling test for normality
+ad.test(data_PedsQL_B1$p_soc)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_p_soc, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_p_soc)
+```
+
+```{r}
+# Assumption check school functioning
+# Create model
+ANOVA_p_school <- aov(p_school ~ class, data = data_PedsQL_B1)
+# Plot QQ-plot to test for normality
+qqnorm(residuals(ANOVA_p_school))
+qqline(residuals(ANOVA_p_school))
+# Compute Anderson-Darling test for normality
+ad.test(data_PedsQL_B1$p_school)
+
+# Plot residual plot for homogeinity of variances
+plot(ANOVA_p_school, which = 1)
+# Compute levene's test for homogeinity of variances
+leveneTest(ANOVA_p_school)
+```
+
+## Analysis 
+
+### (Robust) ANOVA & Post-hoc
+
+#### Support at home
+
+```{r}
+# Run robust ANOVA
+rbANOVA_support_thuis <- t1way(support_home ~ class, data = data_support_B1)
+print(rbANOVA_support_thuis)
+```
+
+#### Support from friends
+
+```{r}
+# Run robust ANOVA physical functioning
+rbANOVA_support_friends <- t1way(support_friends ~ class, data = data_support_B1)
+print(rbANOVA_support_friends)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_support_friends <- dunnTest(data_support_B1$support_friends, data_support_B1$class, method = "holm")
+print(post_hoc_support_friends)
+```
+
+#### Personal competence
+
+```{r}
+# Run robust ANOVA
+rbANOVA_READ_perscomp <- t1way(READ_subschaal_perscomp ~ class, data = data_READ_B1)
+print(rbANOVA_READ_perscomp)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_READ_perscomp <- dunnTest(data_READ_B1$READ_subschaal_perscomp, data_READ_B1$class, method = "holm")
+print(post_hoc_READ_perscomp)
+```
+
+#### Social competence
+
+```{r}
+# Run robust ANOVA
+rbANOVA_READ_soccomp <- t1way(READ_subschaal_soccomp ~ class, data = data_READ_B1)
+print(rbANOVA_READ_soccomp)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_READ_soccomp <- dunnTest(data_READ_B1$READ_subschaal_soccomp, data_READ_B1$class, method = "holm")
+print(post_hoc_READ_soccomp)
+```
+
+#### Structured style
+
+```{r}
+# Run robust ANOVA
+rbANOVA_READ_structuur <- t1way(READ_subschaal_structuur ~ class, data = data_READ_B1)
+print(rbANOVA_READ_structuur)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_READ_structuur <- dunnTest(data_READ_B1$READ_subschaal_structuur, data_READ_B1$class, method = "holm")
+print(post_hoc_READ_structuur)
+```
+
+#### Social support
+
+```{r}
+# Run robust ANOVA
+rbANOVA_READ_socsteun <- t1way(READ_subschaal_socsteun ~ class, data = data_READ_B1)
+print(rbANOVA_READ_socsteun)
+```
+
+#### Family cohesion
+
+```{r}
+# Run robust ANOVA
+rbANOVA_READ_famcohesie <- t1way(READ_subschaal_famcohesie ~ class, data = data_READ_B1)
+print(rbANOVA_READ_famcohesie)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_READ_famcohesie <- dunnTest(data_READ_B1$READ_subschaal_famcohesie, data_READ_B1$class, method = "holm")
+print(post_hoc_READ_famcohesie)
+```
+
+#### Physical functioning
+
+```{r}
+# Run robust ANOVA physical functioning
+rbANOVA_p_lich <- t1way(p_lich ~ class, data = data_PedsQL_B1)
+print(rbANOVA_p_lich)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_p_lich <- dunnTest(data_PedsQL_B1$p_lich, data_PedsQL_B1$class, method = "holm")
+print(post_hoc_p_lich)
+```
+
+#### Emotional functioning
+
+```{r}
+# Run robust ANOVA
+rbANOVA_p_emo <- t1way(p_emo ~ class, data = data_PedsQL_B1)
+print(rbANOVA_p_emo)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_p_emo <- dunnTest(data_PedsQL_B1$p_emo, data_PedsQL_B1$class, method = "holm")
+print(post_hoc_p_emo)
+```
+
+#### Social functioning
+
+```{r}
+# Run robust ANOVA
+rbANOVA_p_soc <- t1way(p_soc ~ class, data = data_PedsQL_B1)
+print(rbANOVA_p_soc)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_p_soc <- dunnTest(data_PedsQL_B1$p_soc, data_PedsQL_B1$class, method = "holm")
+print(post_hoc_p_soc)
+```
+
+#### School functioning
+
+```{r}
+# Run robust ANOVA
+rbANOVA_p_school <- t1way(p_school ~ class, data = data_PedsQL_B1)
+print(rbANOVA_p_school)
+```
+
+```{r}
+# Post-hoc test to check for differences between groups
+post_hoc_p_school <- dunnTest(data_PedsQL_B1$p_school, data_PedsQL_B1$class, method = "holm")
+print(post_hoc_p_school)
+```
+
+
+## Cronbach's alpha
+
+### Factors from the HBSC (support at home, support from friends)
+
+```{r}
+# Add mean scores of support items
+data_support_CA <- create_data(data_removed, c('k_alg_pro_ext_12_18_new_InvulDatum', 'k_alg_pro_ext_12_18_new_thuis_steun_1', 'k_alg_pro_ext_12_18_new_thuis_steun_2', 'k_alg_pro_ext_12_18_new_thuis_steun_3', 'k_alg_pro_ext_12_18_new_thuis_steun_4', 'k_alg_pro_ext_12_18_new_uitspraken_vrienden_1', 'k_alg_pro_ext_12_18_new_uitspraken_vrienden_2', 'k_alg_pro_ext_12_18_new_uitspraken_vrienden_3', 'k_alg_pro_ext_12_18_new_uitspraken_vrienden_4', "k_alg_pro_ext_8_11_new_InvulDatum", 'k_alg_pro_ext_8_11_new_thuis_steun_1', 'k_alg_pro_ext_8_11_new_thuis_steun_2', 'k_alg_pro_ext_8_11_new_thuis_steun_3', 'k_alg_pro_ext_8_11_new_thuis_steun_4', 'k_alg_pro_ext_8_11_new_uitspraken_vrienden_1', 'k_alg_pro_ext_8_11_new_uitspraken_vrienden_2', 'k_alg_pro_ext_8_11_new_uitspraken_vrienden_3', 'k_alg_pro_ext_8_11_new_uitspraken_vrienden_4', "k_alg_pro_ext_12_18_InvulDatum", 'k_alg_pro_ext_12_18_uitspraken_gezin_1', 'k_alg_pro_ext_12_18_uitspraken_gezin_2', 'k_alg_pro_ext_12_18_uitspraken_gezin_3', 'k_alg_pro_ext_12_18_uitspraken_gezin_4', 'k_alg_pro_ext_12_18_uitspraken_vrienden_1', 'k_alg_pro_ext_12_18_uitspraken_vrienden_2', 'k_alg_pro_ext_12_18_uitspraken_vrienden_3', 'k_alg_pro_ext_12_18_uitspraken_vrienden_4', "k_alg_pro_ext_8_11_InvulDatum", 'k_alg_pro_ext_8_11_uitspraken_gezin_1', 'k_alg_pro_ext_8_11_uitspraken_gezin_2', 'k_alg_pro_ext_8_11_uitspraken_gezin_3', 'k_alg_pro_ext_8_11_uitspraken_gezin_4', 'k_alg_pro_ext_8_11_uitspraken_vrienden_1', 'k_alg_pro_ext_8_11_uitspraken_vrienden_2', 'k_alg_pro_ext_8_11_uitspraken_vrienden_3', 'k_alg_pro_ext_8_11_uitspraken_vrienden_4', "k_alg_pro_8_11_InvulDatum", 'k_alg_pro_8_11_thuis_steun_1', 'k_alg_pro_8_11_thuis_steun_2', 'k_alg_pro_8_11_thuis_steun_3', 'k_alg_pro_8_11_thuis_steun_4', 'k_alg_pro_8_11_vrienden_steun_1', 'k_alg_pro_8_11_vrienden_steun_2', 'k_alg_pro_8_11_vrienden_steun_3', 'k_alg_pro_8_11_vrienden_steun_4', "k_alg_pro_8_11_new_InvulDatum", 'k_alg_pro_8_11_new_thuis_steun_1', 'k_alg_pro_8_11_new_thuis_steun_2', 'k_alg_pro_8_11_new_thuis_steun_3', 'k_alg_pro_8_11_new_thuis_steun_4', 'k_alg_pro_8_11_new_vrienden_steun_1', 'k_alg_pro_8_11_new_vrienden_steun_2', 'k_alg_pro_8_11_new_vrienden_steun_3', "k_alg_pro_12_18_InvulDatum", 'k_alg_pro_12_18_thuis_steun_1', 'k_alg_pro_12_18_thuis_steun_2', 'k_alg_pro_12_18_thuis_steun_3', 'k_alg_pro_12_18_thuis_steun_4','k_alg_pro_12_18_vrienden_steun_1', 'k_alg_pro_12_18_vrienden_steun_2', 'k_alg_pro_12_18_vrienden_steun_3', 'k_alg_pro_12_18_vrienden_steun_4', "k_alg_pro_12_18_new_InvulDatum", 'k_alg_pro_12_18_new_thuis_steun_1', 'k_alg_pro_12_18_new_thuis_steun_2', 'k_alg_pro_12_18_new_thuis_steun_3', 'k_alg_pro_12_18_new_thuis_steun_4', 'k_alg_pro_12_18_new_vrienden_steun_1', 'k_alg_pro_12_18_new_vrienden_steun_2', 'k_alg_pro_12_18_new_vrienden_steun_3', 'k_alg_pro_12_18_new_vrienden_steun_4'))
+
+data_support_CA <- create_data_B1(data_support_CA)
+```
+
+```{r}
+# Merge the items
+data_support_CA <- unite(data_support_CA, support_home1, ends_with("1") & (contains("gezin") | contains("thuis")), sep = " ", na.rm = TRUE)
+data_support_CA <- unite(data_support_CA, support_home2, ends_with("2") & (contains("gezin") | contains("thuis")), sep = " ", na.rm = TRUE) 
+data_support_CA <- unite(data_support_CA, support_home3, ends_with("3") & (contains("gezin") | contains("thuis")), sep = " ", na.rm = TRUE) 
+data_support_CA <- unite(data_support_CA, support_home4, ends_with("4") & (contains("gezin") | contains("thuis")), sep = " ", na.rm = TRUE) 
+data_support_CA <- unite(data_support_CA, support_friends1, ends_with("1") & contains("vrienden"), sep = " ", na.rm = TRUE)
+data_support_CA <- unite(data_support_CA, support_friends2, ends_with("2") & contains("vrienden"), sep = " ", na.rm = TRUE) 
+data_support_CA <- unite(data_support_CA, support_friends3, ends_with("3") & contains("vrienden") & !contains("k_alg_pro_8_11_new"), sep = " ", na.rm = TRUE)
+data_support_CA <- unite(data_support_CA, support_friends4, (ends_with("4") & contains("vrienden")) | contains("k_alg_pro_8_11_new_vrienden_steun_3"), sep = " ", na.rm = TRUE)
+```
+
+```{r}
+cronbach.alpha(data_support_CA[, grepl("home", names(data_support_CA))], na.rm = TRUE)
+cronbach.alpha(data_support_CA[, grepl("friends", names(data_support_CA))], na.rm = TRUE)
+```
+
+### Factors from the READ
+
+```{r}
+data_READ_CA <- create_data(data_removed, c('self_veerkracht_InvulDatum', 'self_veerkracht_grid1_1', 'self_veerkracht_grid1_2', 'self_veerkracht_grid1_3', 'self_veerkracht_grid1_4', 'self_veerkracht_grid1_5', 'self_veerkracht_grid1_6', 'self_veerkracht_grid1_7', 'self_veerkracht_grid1_8', 'self_veerkracht_grid1_9', 'self_veerkracht_grid1_10', 'self_veerkracht_grid1_11', 'self_veerkracht_grid1_12', 'self_veerkracht_grid1_13', 'self_veerkracht_grid1_14', 'self_veerkracht_grid2_15', 'self_veerkracht_grid2_16', 'self_veerkracht_grid2_17', 'self_veerkracht_grid2_18', 'self_veerkracht_grid2_19', 'self_veerkracht_grid2_20', 'self_veerkracht_grid2_21', 'self_veerkracht_grid2_22', 'self_veerkracht_grid2_23', 'self_veerkracht_grid2_24', 'self_veerkracht_grid2_25', 'self_veerkracht_grid2_26', 'self_veerkracht_grid2_27', 'self_veerkracht_grid2_28'))
+
+data_READ_CA <- create_data_B1(data_READ_CA)
+```
+
+```{r}
+# Compute cronbach's alpha per subdomain
+# Personal competence
+cronbach.alpha(data_READ_CA[, c(6, 9, 14, 19, 22, 25, 28)], na.rm = TRUE)
+# Social competence
+cronbach.alpha(data_READ_CA[, c(8, 11, 13, 18, 24, 27)], na.rm = TRUE)
+# Social support
+cronbach.alpha(data_READ_CA[, c(3, 5, 16, 21, 30)], na.rm = TRUE)
+# Family cohesion
+cronbach.alpha(data_READ_CA[, c(7, 12, 17, 20, 23, 26, 29)], na.rm = TRUE)
+# Structured style
+cronbach.alpha(data_READ_CA[, c(4, 10, 15)], na.rm = TRUE)
+```
+
+### Factors from PedsQL
+
+```{r}
+data_PedsQL_CA <- create_data(data_removed, c('k_pedsql_8_12_InvulDatum', 'k_pedsql_13_17_InvulDatum', 'k_pedsql_8_12_lichamelijk_1', 'k_pedsql_8_12_lichamelijk_2', 'k_pedsql_8_12_lichamelijk_3', 'k_pedsql_8_12_lichamelijk_4', 'k_pedsql_8_12_lichamelijk_5', 'k_pedsql_8_12_lichamelijk_6', 'k_pedsql_8_12_lichamelijk_7', 'k_pedsql_8_12_lichamelijk_8', 'k_pedsql_8_12_emotioneel_1', 'k_pedsql_8_12_emotioneel_2', 'k_pedsql_8_12_emotioneel_3', 'k_pedsql_8_12_emotioneel_4', 'k_pedsql_8_12_emotioneel_5', 'k_pedsql_8_12_sociaal_1', 'k_pedsql_8_12_sociaal_2', 'k_pedsql_8_12_sociaal_3', 'k_pedsql_8_12_sociaal_4', 'k_pedsql_8_12_sociaal_5', 'k_pedsql_8_12_school_1', 'k_pedsql_8_12_school_2', 'k_pedsql_8_12_school_3', 'k_pedsql_8_12_school_4', 'k_pedsql_8_12_school_5', 'k_pedsql_13_17_lichamelijk_1', 'k_pedsql_13_17_lichamelijk_2', 'k_pedsql_13_17_lichamelijk_3', 'k_pedsql_13_17_lichamelijk_4', 'k_pedsql_13_17_lichamelijk_5', 'k_pedsql_13_17_lichamelijk_6', 'k_pedsql_13_17_lichamelijk_7', 'k_pedsql_13_17_lichamelijk_8', 'k_pedsql_13_17_emotioneel_1', 'k_pedsql_13_17_emotioneel_2', 'k_pedsql_13_17_emotioneel_3', 'k_pedsql_13_17_emotioneel_4', 'k_pedsql_13_17_emotioneel_5', 'k_pedsql_13_17_sociaal_1', 'k_pedsql_13_17_sociaal_2', 'k_pedsql_13_17_sociaal_3', 'k_pedsql_13_17_sociaal_4', 'k_pedsql_13_17_sociaal_5', 'k_pedsql_13_17_school_1', 'k_pedsql_13_17_school_2', 'k_pedsql_13_17_school_3', 'k_pedsql_13_17_school_4', 'k_pedsql_13_17_school_5'))
+
+data_PedsQL_CA <- create_data_B1(data_PedsQL_CA)
+```
+
+```{r}
+# Merge the items that contain information from the same question over the different variables (different in age)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich1, contains("lichamelijk_1"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich2, contains("lichamelijk_2"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich3, contains("lichamelijk_3"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich4, contains("lichamelijk_4"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich5, contains("lichamelijk_5"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich6, contains("lichamelijk_6"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich7, contains("lichamelijk_7"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_lich8, contains("lichamelijk_8"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_emo1, contains("emotioneel_1"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_emo2, contains("emotioneel_2"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_emo3, contains("emotioneel_3"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_emo4, contains("emotioneel_4"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_emo5, contains("emotioneel_5"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_soc1, contains("sociaal_1"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_soc2, contains("sociaal_2"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_soc3, contains("sociaal_3"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_soc4, contains("sociaal_4"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_soc5, contains("sociaal_5"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_school1, contains("school_1"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_school2, contains("school_2"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_school3, contains("school_3"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_school4, contains("school_4"), sep = " ", na.rm = TRUE)
+data_PedsQL_CA <- unite(data_PedsQL_CA, p_school5, contains("school_5"), sep = " ", na.rm = TRUE)
+```
+
+```{r}
+# Compute cronbach's alpha per subdomain
+cronbach.alpha(data_PedsQL_CA[, grepl("p_lich", names(data_PedsQL_CA))], na.rm = TRUE)
+cronbach.alpha(data_PedsQL_CA[, grepl("p_emo", names(data_PedsQL_CA))], na.rm = TRUE)
+cronbach.alpha(data_PedsQL_CA[, grepl("p_soc", names(data_PedsQL_CA))], na.rm = TRUE)
+cronbach.alpha(data_PedsQL_CA[, grepl("p_school", names(data_PedsQL_CA))], na.rm = TRUE)
+```
+
+# Other
+
+```{r}
+# Compute correlation between HBSC Cantril and COVID cantril
+
+data_outcomes_cantril <- create_data(data_removed, c("k_alg_pro_ext_12_18_new_InvulDatum", "k_alg_pro_ext_12_18_new_mening_leven", "k_alg_pro_ext_8_11_new_InvulDatum", "k_alg_pro_ext_8_11_new_mening_leven",  "k_alg_pro_ext_12_18_InvulDatum", "k_alg_pro_ext_12_18_mening_leven", "k_alg_pro_ext_8_11_InvulDatum", "k_alg_pro_ext_8_11_mening_leven", "k_alg_pro_8_11_InvulDatum", "k_alg_pro_8_11_leven", "k_alg_pro_8_11_new_InvulDatum", "k_alg_pro_8_11_new_leven", "k_alg_pro_12_18_InvulDatum",  "k_alg_pro_12_18_leven", "k_alg_pro_12_18_new_InvulDatum", "k_alg_pro_12_18_new_leven", "self_covid_k_InvulDatum", "self_covid_k_gevoelens"))
+```
+
+```{r}
+data_outcomes_cantril <- data_outcomes_cantril %>% mutate(LS_HBSC = coalesce(!!!dplyr::select(., contains("leven"))))
+
+cor(data_outcomes_cantril[, c(11, 13)], use = "pairwise.complete.obs")
+```
+
