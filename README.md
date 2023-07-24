@@ -1,6 +1,6 @@
 # Student Projects
 
-This folder contains scripts related to student projects that are unpublished.
+This folder contains scripts from _unpublished_ student projects that (re)used data from the PROactive Cohort Study.
 
 The projects are listed below:
 
